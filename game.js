@@ -7,6 +7,8 @@ const banner=document.getElementById('banner');
 const SESSION='onuw_fb_session_v1';
 let me=null,roomCode=null,nickname='',meta=null,members={},pub=null,priv=null,result=null,myVote=null;
 let roleDraft=null,selected=[],subs=[],hostSubs=[],hostRoom=null,hostQueue=Promise.resolve(),timerHandle=null;
+let roomLoaded={meta:false,members:false};
+let entryBusy=false;
 const immediateDoppel=new Set(['seer','robber','troublemaker','drunk']);
 
 const esc=s=>String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
@@ -20,10 +22,27 @@ const cardMarkup=r=>`<div class="role-icon">${roleEmoji(r)}</div><div class="rol
 function flash(msg,kind='ok'){banner.textContent=msg;banner.className=`banner ${kind==='error'?'error':''}`;setTimeout(()=>{if(banner.textContent===msg)banner.classList.add('hidden')},4000)}
 function saveSession(){if(roomCode)localStorage.setItem(SESSION,JSON.stringify({roomCode,nickname}))}
 function clearSession(){localStorage.removeItem(SESSION)}
-function stopAll(){for(const off of [...subs,...hostSubs])try{off()}catch{};subs=[];hostSubs=[];hostRoom=null}
+function stopAll(){for(const off of [...subs,...hostSubs])try{off()}catch{};subs=[];hostSubs=[];hostRoom=null;roomLoaded={meta:false,members:false}}
+function setEntryBusy(busy){
+  entryBusy=busy;
+  const create=document.getElementById('create'),join=document.getElementById('join');
+  if(create){create.disabled=busy;create.textContent=busy?'처리 중…':'새 방 만들기'}
+  if(join){join.disabled=busy;join.textContent=busy?'처리 중…':'방 참가하기'}
+}
 
 async function boot(){
-  try{me=await ensureLogin()}catch(e){app.innerHTML=`<div class="card"><h2 class="title">Firebase 연결 실패</h2><div class="hint">${esc(e.message)}</div></div>`;return}
+  try{
+    me=await ensureLogin();
+
+    // Realtime Database를 실제로 사용하는 앱이므로 databaseURL 누락을 초기에 잡아준다.
+    const databaseURL=db?.app?.options?.databaseURL;
+    if(!databaseURL){
+      throw new Error('firebaseConfig에 databaseURL이 없습니다. Firebase Console → Realtime Database에서 URL을 복사해 firebase.js에 추가하세요.');
+    }
+  }catch(e){
+    app.innerHTML=`<div class="card"><h2 class="title">Firebase 연결 설정 확인 필요</h2><div class="hint">${esc(e.message)}</div></div>`;
+    return;
+  }
   const saved=JSON.parse(localStorage.getItem(SESSION)||'null');
   if(saved?.roomCode){const s=await get(ref(db,`rooms/${saved.roomCode}/members/${me.uid}`));if(s.exists()){roomCode=saved.roomCode;nickname=saved.nickname||s.val()?.name||'';listenRoom();return}else clearSession()}
   renderLanding();
@@ -35,39 +54,110 @@ function renderLanding(){stopAll();roomCode=null;meta=null;members={};pub=null;p
 }
 
 async function createRoom(){
-  const name=document.getElementById('nick').value.trim();if(!name||name.length>20)return flash('닉네임을 1~20자로 입력해 주세요.','error');
-  let code='';for(let i=0;i<12;i++){const c=rcode();const s=await get(ref(db,`rooms/${c}/meta`));if(!s.exists()){code=c;break}}
-  if(!code)return flash('방 코드 생성 실패. 다시 시도해 주세요.','error');
-  const now=Date.now();
+  if(entryBusy)return;
+  const name=document.getElementById('nick').value.trim();
+  if(!name||name.length>20)return flash('닉네임을 1~20자로 입력해 주세요.','error');
+
+  let code='';
+  setEntryBusy(true);
   try{
+    for(let i=0;i<12;i++){
+      const c=rcode();
+      const snap=await get(ref(db,`rooms/${c}/meta`));
+      if(!snap.exists()){code=c;break}
+    }
+    if(!code)throw new Error('방 코드 생성에 실패했습니다. 다시 시도해 주세요.');
+
+    const now=Date.now();
+    // 순차 생성하되 실패 시 고아 방을 정리한다.
     await set(ref(db,`rooms/${code}/meta`),{hostUid:me.uid,phase:'lobby',createdAt:now,discussionSeconds:300,roleConfig:[]});
     await set(ref(db,`rooms/${code}/members/${me.uid}`),{name,joinedAt:now});
     await set(ref(db,`rooms/${code}/public`),{phase:'lobby',updatedAt:now});
+
     roomCode=code;nickname=name;saveSession();listenRoom();
-  }catch(e){flash(`방 생성 실패: ${e.message}`,'error')}
+  }catch(e){
+    console.error('createRoom failed',e);
+    // meta까지 만들어졌는데 이후 단계가 실패한 경우 가능한 범위에서 정리한다.
+    if(code){
+      try{await remove(ref(db,`rooms/${code}/public`))}catch{}
+      try{await remove(ref(db,`rooms/${code}/members/${me.uid}`))}catch{}
+      try{await remove(ref(db,`rooms/${code}/meta`))}catch{}
+    }
+    setEntryBusy(false);
+    flash(`방 생성 실패: ${e?.message||e}`,'error');
+  }
 }
 
 async function joinRoom(){
+  if(entryBusy)return;
   const name=document.getElementById('nick').value.trim(),code=document.getElementById('code').value.trim().toUpperCase();
   if(!name||name.length>20)return flash('닉네임을 1~20자로 입력해 주세요.','error');
   if(!/^[A-Z0-9]{6}$/.test(code))return flash('방 코드 6자리를 입력해 주세요.','error');
+  setEntryBusy(true);
   try{
     const ms=await get(ref(db,`rooms/${code}/meta`));if(!ms.exists())throw new Error('존재하지 않는 방입니다.');if(ms.val().phase!=='lobby')throw new Error('이미 시작된 방입니다.');
     const ps=await get(ref(db,`rooms/${code}/members`)),list=ps.val()??{};if(Object.keys(list).length>=10)throw new Error('최대 10명까지 참가할 수 있습니다.');
     if(Object.values(list).some(p=>String(p?.name??'').toLowerCase()===name.toLowerCase()))throw new Error('이미 사용 중인 닉네임입니다.');
-    await set(ref(db,`rooms/${code}/members/${me.uid}`),{name,joinedAt:Date.now()});roomCode=code;nickname=name;saveSession();listenRoom();
-  }catch(e){flash(e.message,'error')}
+    await set(ref(db,`rooms/${code}/members/${me.uid}`),{name,joinedAt:Date.now()});
+    roomCode=code;nickname=name;saveSession();listenRoom();
+  }catch(e){
+    setEntryBusy(false);
+    console.error('joinRoom failed',e);
+    flash(`방 참가 실패: ${e?.message||e}`,'error');
+  }
 }
 
 function listenRoom(){
   stopAll();
-  const items=[['meta',v=>meta=v],['members',v=>members=v??{}],['public',v=>pub=v],[`private/${me.uid}`,v=>priv=v],['result',v=>result=v],[`votes/${me.uid}`,v=>myVote=v??null]];
-  for(const [path,setter] of items)subs.push(onValue(ref(db,`rooms/${roomCode}/${path}`),s=>{setter(s.val());stateChanged()},e=>console.warn(path,e)));
+  // Firebase의 각 onValue는 독립적으로 최초 값을 전달한다.
+  // meta가 members보다 먼저 오는 정상적인 상황을 '방에서 나감'으로 오판하지 않도록
+  // 두 핵심 스냅샷의 최초 로딩 완료 여부를 따로 추적한다.
+  roomLoaded={meta:false,members:false};
+
+  const items=[
+    ['meta',v=>meta=v,()=>roomLoaded.meta=true],
+    ['members',v=>members=v??{},()=>roomLoaded.members=true],
+    ['public',v=>pub=v,null],
+    [`private/${me.uid}`,v=>priv=v,null],
+    ['result',v=>result=v,null],
+    [`votes/${me.uid}`,v=>myVote=v??null,null]
+  ];
+
+  for(const [path,setter,markLoaded] of items){
+    subs.push(onValue(
+      ref(db,`rooms/${roomCode}/${path}`),
+      s=>{setter(s.val());if(markLoaded)markLoaded();stateChanged()},
+      e=>{console.error('room listener failed',path,e);flash(`방 데이터 읽기 실패: ${e?.message||e}`,'error')}
+    ));
+  }
 }
 
 function stateChanged(){
-  if(!meta)return;if(!members?.[me.uid]){clearSession();renderLanding();flash('방에서 나왔습니다.');return}
-  if(isHost()){ensureHostWatchers();if(meta.phase==='night')hostQueue=hostQueue.then(()=>ensureNight()).catch(console.error)}else if(hostRoom)stopHostWatchers();render();
+  // meta/members 두 리스너가 모두 최초 값을 받은 뒤에만 방 상태를 판정한다.
+  if(!roomLoaded.meta||!roomLoaded.members)return;
+
+  if(!meta){
+    clearSession();
+    renderLanding();
+    flash('존재하지 않거나 삭제된 방입니다.','error');
+    return;
+  }
+
+  if(!members?.[me.uid]){
+    clearSession();
+    renderLanding();
+    flash('이 방의 참가자 목록에 내가 없습니다. 다시 참가해 주세요.','error');
+    return;
+  }
+
+  entryBusy=false;
+  if(isHost()){
+    ensureHostWatchers();
+    if(meta.phase==='night')hostQueue=hostQueue.then(()=>ensureNight()).catch(console.error);
+  }else if(hostRoom){
+    stopHostWatchers();
+  }
+  render();
 }
 function ensureHostWatchers(){
   if(hostRoom===roomCode)return;stopHostWatchers();hostRoom=roomCode;
@@ -195,5 +285,15 @@ async function resolveGame(s,list,votes){
 function resultName(uid){return result?.players?.find(p=>p.uid===uid)?.name??'없음'}
 function renderResult(){if(!result){app.innerHTML=header()+`<div class="hint">결과 계산 중입니다.</div>`;bindHeader();return}const wins=[];if(result.villageWin)wins.push('🏘️ 마을 팀 승리');if(result.werewolfWin)wins.push('🐺 늑대 팀 승리');if(result.tannerWinners?.length)wins.push(`🪵 무두장이 승리: ${result.tannerWinners.map(resultName).join(', ')}`);if(!wins.length)wins.push('승자 없음');app.innerHTML=header()+`<div class="card hero"><div class="role-icon">🎭</div><div class="role-big">${wins.map(esc).join('<br>')}</div></div><div class="card"><h3 class="title">최종 카드 공개</h3>${(result.players??[]).map(p=>`<div class="result-row"><div><b>${esc(p.name)}</b><div class="muted">→ ${esc(resultName(p.voteTarget))} 투표 · ${p.voteCount??0}표 받음</div></div><div style="text-align:right"><b>${roleEmoji(p.role)} ${esc(roleLabel(p.role))}</b><div class="${p.dead?'dead':'alive'}">${p.dead?'사망':'생존'}</div></div></div>`).join('')}</div><div class="card"><h3 class="title">중앙 카드</h3><div class="grid3">${(result.centers??[]).map(c=>`<div class="center-card"><div class="muted">중앙 ${c.index+1}</div><div style="font-size:24px;margin:5px">${roleEmoji(c.role)}</div><b>${esc(roleLabel(c.role))}</b></div>`).join('')}</div></div>${isHost()?`<div class="sticky"><button class="btn btn-primary btn-wide" id="rematch">같은 멤버로 다시 하기</button></div>`:`<div class="hint">방장이 재경기를 시작할 수 있습니다.</div>`}`;bindHeader();const r=document.getElementById('rematch');if(r)r.onclick=resetLobby}
 async function resetLobby(){await update(ref(db,`rooms/${roomCode}`),{'meta/phase':'lobby','public':{phase:'lobby',updatedAt:Date.now()},'engine':null,'private':null,'intents':null,'votes':null,'result':null});roleDraft=null;selected=[]}
+
+window.addEventListener('unhandledrejection',(event)=>{
+  console.error('Unhandled promise rejection:',event.reason);
+  const message=event.reason?.message||String(event.reason||'알 수 없는 오류');
+  flash(`오류: ${message}`,'error');
+});
+
+window.addEventListener('error',(event)=>{
+  console.error('Global error:',event.error||event.message);
+});
 
 boot();
